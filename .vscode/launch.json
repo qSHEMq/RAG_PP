@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {"name":"Python Debugger: Current File","type":"debugpy","request":"launch","program":"${file}","console":"integratedTerminal"},
+    {
+      "name": "PaddleOCR ppstructure",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/PaddleOCR/ppstructure/predict_system.py",
+      "cwd": "${workspaceFolder}/PaddleOCR",
+      "console": "integratedTerminal",
+      "args": [
+        "--image_dir", "F:\\AllnAll\\Project_3\\OCR\\Input",
+        "--output",    "F:\\AllnAll\\Project_3\\OCR\\Output",
+        "--ocr", "true",
+        "--layout", "true",
+        "--table", "true",
+        "--det_model_dir",   "F:\\AllnAll\\Project_3\\OCR\\PaddleOCR\\inference\\ch_PP-OCRv3_det_infer",
+        "--rec_model_dir",   "F:\\AllnAll\\Project_3\\OCR\\PaddleOCR\\inference\\cyrillic_PP-OCRv3_rec_infer",
+        "--table_model_dir", "F:\\AllnAll\\Project_3\\OCR\\PaddleOCR\\inference\\table_infer",
+        "--layout_model_dir","F:\\AllnAll\\Project_3\\OCR\\PaddleOCR\\inference\\layout_infer",
+        "--layout_dict_path","F:\\AllnAll\\Project_3\\OCR\\PaddleOCR\\ppocr\\utils\\dict\\layout_dict\\layout_publaynet_dict.txt"
+      ],
+      "env": {
+        "FLAGS_allocator_strategy": "auto_growth"
+      }
+    }
+  ]
+}
