@@ -1,189 +1,326 @@
-OCR + YOLO raw JSON
-Проект извлекает “сырой” (raw) OCR-слой из изображения документа и сохраняет единый JSON с:
+# Система распознавания бухгалтерских документов
 
-полным результатом OCR inline (структура PaddleOCR, полигоны и текст);
+Настольное приложение для автоматического распознавания типовых бухгалтерских документов: УПД, ТОРГ-12 и Счёт-фактура. Извлекает реквизиты и табличные данные, формирует структурированный JSON.
 
-детекциями layout-блоков (YOLO layout);
+## Возможности
 
-детекциями таблиц (YOLO tables) и, при наличии, результатами Table Structure Recognition (TSR) для каждой таблицы.
+- **Определение типа документа** — автоматическая классификация УПД, ТОРГ-12, Счёт-фактура
+- **OCR изображений** — распознавание PNG, JPEG, PDF (без текстового слоя)
+- **Извлечение реквизитов** — дата, номер, продавец/покупатель, ИНН, КПП, адреса
+- **Парсинг табличных частей** — товары, количество, цена, суммы, НДС
+- **Валидация данных** — арифметические проверки, контроль нумерации строк
+- **Формирование JSON** — структурированный вывод по JSON Schema
+- **Пакетная обработка** — обработка всех файлов в папке
+- **CLI и GUI** — командная строка и графический интерфейс (PyQt5)
 
-Этот слой не делает бизнес‑структуризацию (реквизиты, таблицы как объекты домена), а даёт максимально подробное представление документа для следующего этапа (AI‑агент, правила, NLP).
+## Установка
 
-Структура проекта
-run_all.py
-Главная точка входа. Запускает весь пайплайн: паддинг изображения → OCR → YOLO layout → YOLO tables → TSR → запись единого JSON.
+### 1. Клонирование репозитория
 
-export_raw_json.py
-Вспомогательные функции:
+```bash
+git clone <repository-url>
+cd RAG_PP
+```
 
-xyxy_to_xywh(xyxy): конвертирует bbox из формата 
-[
-x
-1
-,
-y
-1
-,
-x
-2
-,
-y
-2
-]
-[x1,y1,x2,y2] в словарь {x, y, w, h}.
+### 2. Создание виртуального окружения
 
-paddle_result_to_dict(res_obj, tmp_json_path): сохраняет результат PaddleOCR/TSR во временный JSON и загружает его как dict.
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/macOS
+# или
+venv\Scripts\activate     # Windows
+```
 
-yolo_layout.py
-Обёртка над Ultralytics YOLO для определения layout-блоков (Page-header, Table, Text, Picture, Page-footer и т.п.).
-Возвращает список DetBox с полями label, conf, xyxy. Детекции сортируются сверху‑вниз, слева‑направо.
+### 3. Установка зависимостей
 
-yolo_tables.py
-Обёртка над Ultralytics YOLO для поиска таблиц. Фильтрует только класс "Table" и возвращает список TableDet с conf и xyxy.
+```bash
+pip install -r requirements.txt
+```
 
-table_html_to_grid.py
-Утилита для преобразования HTML‑таблицы (из TSR) в двумерный массив grid (List[List[str]]), где каждая вложенная строка — это список ячеек таблицы.
+### 4. Установка Ollama (опционально, для LLM-извлечения)
 
-ocr.py
-Тестовый скрипт для отдельного запуска PaddleOCR. Сейчас основная логика вынесена в run_all.py, этот файл можно использовать для локальных экспериментов или вовсе не использовать.
+LLM-извлечение отключено по умолчанию. Если хотите использовать LLM для улучшения качества на сложных документах:
 
-Зависимости
-Проект использует:
+```bash
+# Linux
+curl -fsSL https://ollama.com/install.sh | sh
 
-paddleocr — распознавание текста и структуры таблиц;
+# Рекомендуемые модели (7b+ для качественного JSON-вывода):
+ollama pull qwen2.5:7b-instruct    # Рекомендуется
+ollama pull llama3.1:8b            # Альтернатива
 
-ultralytics — модели YOLO для layout и таблиц;
+# Windows — скачайте установщик с https://ollama.com
+```
 
-opencv-python (cv2) — чтение изображений, кропы, добавление бордюров;
+> **Важно**: Маленькие модели (3b и меньше) плохо следуют JSON-формату. Рекомендуется использовать модели 7b+.
 
-beautifulsoup4 — парсинг HTML таблиц.
+### 5. Веса YOLO (опционально)
 
-Рекомендуется управлять зависимостями через pyproject.toml и uv.lock.
+Поместите веса DocLayNet в папку `weights/`:
+```
+weights/yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt
+```
 
-Настройка окружения с uv
-Инициализация проекта (если pyproject.toml ещё не создан):
+## Использование
 
-bash
-uv init --bare
-Добавление зависимостей (если нет requirements.txt):
+### Командная строка (CLI)
 
-bash
-uv add paddleocr ultralytics opencv-python beautifulsoup4
-uv lock
-uv sync --locked
-Если уже есть requirements.txt, его можно импортировать в pyproject.toml:
+```bash
+# Обработка одного файла (без LLM — по умолчанию)
+python cli.py --input doc.png --output result.json
 
-bash
-uv add -r requirements.txt
-uv lock
-uv sync --locked
-uv.lock фиксирует точные версии пакетов для воспроизводимого окружения.
+# Пакетная обработка папки
+python cli.py --input ./documents/ --batch
 
-Настройки в run_all.py
-В начале run_all.py нужно указать основные пути:
+# С LLM-извлечением (требуется Ollama + модель 7b+)
+python cli.py --input doc.pdf --llm --model qwen2.5:7b-instruct
 
-python
-IMAGE_PATH = r"D:\OCR_PP\RAG_PP\data\TORG-12\Screenshot_1.png"
-YOLO_TABLES_WEIGHTS = r"D:\OCR_PP\RAG_PP\weights\yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt"
-YOLO_LAYOUT_WEIGHTS = r"D:\OCR_PP\RAG_PP\weights\yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt"
-OUT_ROOT = Path(r"D:\OCR_PP\RAG_PP\output")
-Дополнительные параметры:
+# Подробный вывод
+python cli.py --input doc.png -v
+```
 
-SAVE_ARTIFACTS — если True, сохраняются кропы таблиц и аннотированные изображения OCR;
+### Параметры CLI
 
-PAD_LEFT, PAD_TOP, PAD_RIGHT, PAD_BOTTOM — размер белых бордюров, добавляемых к исходному изображению перед OCR/YOLO (нужно, чтобы избежать “обрезания” текста у краёв).
+| Параметр | Описание |
+|----------|----------|
+| `--input`, `-i` | Путь к файлу или папке (обязательный) |
+| `--output`, `-o` | Путь для сохранения JSON |
+| `--batch` | Пакетная обработка папки |
+| `--llm` | Включить LLM-извлечение (рекомендуется модель 7b+) |
+| `--model` | Модель Ollama (по умолчанию: qwen2.5:7b-instruct) |
+| `--yolo-conf` | Порог уверенности YOLO (по умолчанию: 0.10) |
+| `-v`, `--verbose` | Подробный вывод |
 
-Запуск
-После настройки путей и установки зависимостей достаточно выполнить:
+### Графический интерфейс (GUI)
 
-bash
-python run_all.py
-Скрипт:
+```bash
+python app.py
+```
 
-Загружает исходное изображение.
+## Структура проекта
 
-Добавляет белый паддинг (по умолчанию слева).
+```
+RAG_PP/
+├── cli.py                 # CLI интерфейс
+├── app.py                 # GUI интерфейс (PyQt5)
+├── core/                  # Ядро системы
+│   ├── pipeline.py        # Основной пайплайн обработки
+│   ├── extractor.py       # Извлечение данных через LLM
+│   ├── schemas.py         # Pydantic схемы данных
+│   ├── table_parser.py    # Парсинг табличных частей
+│   ├── table_html_to_grid.py
+│   ├── export_raw_json.py
+│   ├── yolo_layout.py     # Детекция layout (YOLO)
+│   └── yolo_tables.py     # Детекция таблиц (YOLO)
+├── schema/
+│   └── structured_document.schema.json
+├── weights/               # Веса YOLO
+├── data/                  # Тестовые документы
+└── output/                # Результаты обработки
+```
 
-Запускает PaddleOCR и получает ocr_raw (полный результат OCR).
+## Формат выходных данных
 
-Запускает YOLO layout и получает список layout‑боксов.
+Результат сохраняется в JSON согласно схеме `schema/structured_document.schema.json`:
 
-Запускает YOLO tables и находит таблицы.
-
-Для каждой таблицы запускает TSR (TableStructureRecognition), получает tsr_raw, опционально HTML и grid.
-
-Формирует единый JSON и сохраняет его в выходную директорию.
-
-Выходные данные
-Результаты записываются в:
-
-text
-<OUT_ROOT>/<image_stem>/
-Где <image_stem> — имя файла изображения без расширения.
-
-Основной файл:
-
-<image_stem>_raw.json — итоговый raw JSON.
-
-Дополнительные артефакты (если SAVE_ARTIFACTS = True):
-
-<image_stem>_annotated/ — изображения с разметкой OCR;
-
-table_crop_<i>.png — кропы каждой найденной таблицы.
-
-Формат <image_stem>_raw.json
-Основные ключи:
-
-schema_version
-Версия схемы raw JSON (например, "0.1").
-
-source
-Информация об источнике (image_path, комментарий о координатах).
-
-image
-Размер padded‑изображения и параметры паддинга:
-
-json
-"image": {
-  "width": <int>,
-  "height": <int>,
-  "pad": { "left": <int>, "top": <int>, "right": <int>, "bottom": <int> }
-}
-layout
-Массив layout‑детекций:
-
-json
+```json
 {
-  "layout_index": 1,
-  "label": "Table",
-  "conf": 0.12,
-  "bbox_xyxy": [x1, y1, x2, y2],
-  "bbox_xywh": {"x": x1, "y": y1, "w": w, "h": h}
+  "fields": {
+    "doc_type": "ТОРГ-12",
+    "doc_number": "11111",
+    "doc_date": "31.10.2025",
+    "seller": {
+      "name": "ООО \"Автотрейд\"",
+      "inn": "7799555720",
+      "kpp": null,
+      "address": null
+    },
+    "buyer": {
+      "name": "ООО \"Эталон\"",
+      "inn": "5612034679",
+      "kpp": null,
+      "address": null
+    },
+    "total_amount": 100000.0,
+    "total_nds": null,
+    "total_with_nds": null,
+    "items": [
+      {
+        "row_num": 1,
+        "name": "Бензин Аи-92",
+        "unit_name": "л",
+        "quantity": 1000,
+        "price": 100.0,
+        "amount": 100000.0,
+        "nds_rate": "20%",
+        "nds_amount": 20000.0
+      }
+    ]
+  },
+  "confidence": 0.8,
+  "warnings": [],
+  "errors": []
 }
-ocr_raw
-Полный результат PaddleOCR (как возвращает библиотека, но встроен inline в JSON).
+```
 
-tables
-Массив найденных таблиц:
+## Извлекаемые поля
 
-json
-{
-  "table_index": 1,
-  "yolo_conf": 0.42,
-  "bbox_xyxy": [x1, y1, x2, y2],
-  "bbox_xywh": {"x": x1, "y": y1, "w": w, "h": h},
-  "crop_image": "path/to/table_crop_1.png",
-  "tsr_raw": { ... },          // полный raw-результат TSR
-  "html": "<table>...</table>",// если извлечён HTML
-  "grid": [["cell11", "cell12"], ["cell21", "cell22"]]
-}
-Переход к следующему слою
-Этот raw JSON — база для:
+### Реквизиты документа (шапка)
 
-извлечения реквизитов (шапка: дата, номер, контрагент, ИНН, КПП, адрес, валюта, ставка НДС);
+| Поле | Описание |
+|------|----------|
+| `doc_type` | Тип документа (УПД, ТОРГ-12, Счёт-фактура) |
+| `doc_number` | Номер документа |
+| `doc_date` | Дата документа (ДД.ММ.ГГГГ) |
+| `sf_number` | Номер счёт-фактуры |
+| `sf_date` | Дата счёт-фактуры |
+| `seller` | Продавец (name, inn, kpp, address) |
+| `buyer` | Покупатель (name, inn, kpp, address) |
+| `consignor` | Грузоотправитель |
+| `consignee` | Грузополучатель |
+| `contract_number` | Номер договора |
+| `contract_date` | Дата договора |
+| `currency` | Валюта (руб., USD, EUR) |
 
-структурирования табличной части (строки, колонки, количества, цены, суммы, НДС);
+### Табличные части (позиции)
 
-валидаций (сквозная нумерация строк, проверка сумм, согласованность НДС).
+| Поле | Описание |
+|------|----------|
+| `row_num` | Номер строки (п/п) |
+| `name` | Наименование товара/услуги |
+| `unit_code` | Код единицы измерения (ОКЕИ) |
+| `unit_name` | Наименование единицы |
+| `quantity` | Количество |
+| `price` | Цена за единицу |
+| `amount` | Сумма без НДС |
+| `nds_rate` | Ставка НДС (20%, 10%, 0%) |
+| `nds_amount` | Сумма НДС |
+| `total_amount` | Сумма с НДС |
 
-Пост‑процессинг (AI‑агент, правила, NLP/NER) будет работать поверх полей ocr_raw, layout и tables, не меняя этот формат JSON.
+## Валидация
+
+Система выполняет следующие проверки:
+
+### Арифметические проверки
+- Количество × Цена = Сумма (для каждой строки)
+- Сумма позиций = Итого документа
+- Проверка расчёта НДС по ставке
+
+### Проверка нумерации строк
+- Последовательность номеров (1, 2, 3...)
+- Отсутствие пропусков
+- Отсутствие дубликатов
+
+### Проверка реквизитов
+- Формат ИНН (10 цифр для юрлиц, 12 для ИП)
+- Наличие обязательных полей
+
+## Пайплайн обработки
+
+```
+Входной файл (PNG/JPG/PDF)
+         │
+         ▼
+┌─────────────────────┐
+│   Загрузка файла    │
+│   + padding         │
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│    PaddleOCR        │──► Распознавание текста (русский)
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│   YOLO Layout       │──► Детекция блоков документа
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│   YOLO Tables       │──► Детекция таблиц
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│   TSR (SLANet)      │──► Структура таблиц
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│   LLM Extractor     │──► Извлечение реквизитов
+│   (Ollama)          │
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│   Table Parser      │──► Парсинг позиций
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│   Валидация         │──► Проверки
+└─────────────────────┘
+         │
+         ▼
+     result.json
+```
+
+## Технологии
+
+| Компонент | Технология |
+|-----------|------------|
+| OCR | PaddleOCR (русский язык) |
+| Layout Detection | YOLOv8 (DocLayNet) |
+| Table Structure | PaddleOCR TSR (SLANet) |
+| LLM | Ollama (Qwen2.5) |
+| GUI | PyQt5 |
+| Схемы данных | Pydantic |
+| PDF | PyMuPDF |
+
+## Системные требования
+
+| Параметр | Требование |
+|----------|------------|
+| ОС | Windows 10/11 x64 или Linux (Astra Linux, Ubuntu, Debian) |
+| RAM | минимум 8 ГБ (рекомендуется 16 ГБ) |
+| CPU | Intel Core i5 12-го поколения или аналог |
+| Диск | SSD, минимум 10 ГБ свободного места |
+
+## Программное использование
+
+```python
+from core.pipeline import DocumentPipeline, PipelineConfig
+
+config = PipelineConfig(
+    yolo_weights="weights/yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt",
+    output_dir="output",
+    ollama_model="qwen2.5:7b-instruct"  # Только если используете LLM
+)
+
+pipeline = DocumentPipeline(config)
+
+# Без LLM (по умолчанию) — быстро и надёжно
+results = pipeline.process_file("document.png", extract_fields=False)
+
+# С LLM — для сложных документов (требуется Ollama)
+# results = pipeline.process_file("document.png", extract_fields=True)
+
+for doc in results:
+    print(f"Тип: {doc.fields.doc_type}")
+    print(f"Номер: {doc.fields.doc_number}")
+    print(f"Дата: {doc.fields.doc_date}")
+    print(f"Продавец: {doc.fields.seller.name}")
+    print(f"Итого: {doc.fields.total_with_nds}")
+```
+
+## Известные ограничения
+
+- LLM-извлечение требует запущенного Ollama и модели 7b+ для надёжной работы
+- Маленькие модели (3b и меньше) плохо следуют JSON-формату
+- Качество распознавания зависит от качества скана
+- Нестандартные формы документов могут распознаваться хуже
+
+## Лицензия
+
+Проект разработан в рамках проектного обучения УрФУ.

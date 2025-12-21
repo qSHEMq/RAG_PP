@@ -1,0 +1,44 @@
+{
+  "fields": {
+    "doc_type": "ТОРГ-12",
+    "doc_number": "11111",
+    "doc_date": "31.10.2025",
+    "sf_number": null,
+    "sf_date": null,
+    "correction_number": null,
+    "correction_date": null,
+    "seller": {
+      "name": "ООО \"Автотрейд\"",
+      "inn": "7799555720",
+      "kpp": null,
+      "address": null,
+      "bank_account": null,
+      "bank_name": null,
+      "bik": null,
+      "corr_account": null
+    },
+    "buyer": {
+      "name": "ООО \"Эталон\"",
+      "inn": "5612034679",
+      "kpp": null,
+      "address": null,
+      "bank_account": null,
+      "bank_name": null,
+      "bik": null,
+      "corr_account": null
+    },
+    "consignor": null,
+    "consignee": null,
+    "contract_number": null,
+    "contract_date": null,
+    "total_quantity": null,
+    "total_amount": null,
+    "total_nds": null,
+    "total_with_nds": null,
+    "currency": null,
+    "items": []
+  },
+  "confidence": 0.6,
+  "warnings": [],
+  "errors": []
+}

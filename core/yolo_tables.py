@@ -1,4 +1,4 @@
-# postprocess/yolo_tables.py
+# core/yolo_tables.py
 from dataclasses import dataclass
 from typing import List, Tuple
 from ultralytics import YOLO
