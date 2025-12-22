@@ -91,10 +91,11 @@ python cli.py --input doc.png -v
 | `--yolo-conf` | Порог уверенности YOLO (по умолчанию: 0.10) |
 | `-v`, `--verbose` | Подробный вывод |
 
-### Графический интерфейс (GUI)
+### Веб-интерфейс (GUI)
 
 ```bash
 python app.py
+# Откроется в браузере: http://127.0.0.1:7860
 ```
 
 ## Структура проекта
@@ -102,7 +103,7 @@ python app.py
 ```
 RAG_PP/
 ├── cli.py                 # CLI интерфейс
-├── app.py                 # GUI интерфейс (PyQt5)
+├── app.py                 # Веб-интерфейс (Gradio)
 ├── core/                  # Ядро системы
 │   ├── pipeline.py        # Основной пайплайн обработки
 │   ├── extractor.py       # Извлечение данных через LLM
@@ -273,8 +274,8 @@ RAG_PP/
 | OCR | PaddleOCR (русский язык) |
 | Layout Detection | YOLOv8 (DocLayNet) |
 | Table Structure | PaddleOCR TSR (SLANet) |
-| LLM | Ollama (Qwen2.5) |
-| GUI | PyQt5 |
+| LLM | Ollama (Qwen2.5) — опционально |
+| GUI | Gradio (веб-интерфейс) |
 | Схемы данных | Pydantic |
 | PDF | PyMuPDF |
 
