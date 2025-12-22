@@ -125,6 +125,11 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
 
     Ищет по ключевым словам: Продавец, Поставщик, Грузоотправитель -> seller
                             Покупатель, Плательщик, Грузополучатель -> buyer
+
+    Улучшенная логика:
+    1. Сначала собираем все организации с ИНН и их контекстом
+    2. Определяем роль каждой организации по маркерам
+    3. Если org и ИНН в одной строке - они связаны
     """
     result = {
         "seller_name": None,
@@ -143,116 +148,219 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
         if not isinstance(rec_texts, list):
             return result
 
-        # Объединяем все тексты с переводами строк
-        full_text = "\n".join(s for s in rec_texts if isinstance(s, str))
-
-        # Паттерны для названий организаций (включая OCR-ошибки типа О0О вместо ООО)
-        org_pattern = r'(?:ООО|О0О|OOO|ЗАО|ПАО|АО|ОАО|ИП|ФГУП|МУП|НКО|ТОО)\s*["\«]?([^"\»,\n]{2,50})["\»]?'
-        inn_pattern = r'ИНН[:\s]*(\d{10}|\d{12})'
+        # Паттерны с учётом OCR-ошибок (О/0/о, O/0)
+        # Возможные варианты ООО: ООО, О0О, OOO, о0о, 000, о00 и т.д.
+        org_prefixes = r'(?:[ОоOo0]{3}|ЗАО|ПАО|АО|ОАО|ИП|ФГУП|МУП|НКО|ТОО)'
+        # Паттерн для названий: до запятой или "ИНН" (чтобы захватить "ООО ШО "Большевичка"")
+        org_pattern = rf'({org_prefixes}\s*[^,\n]{{2,60}}?)(?=,|\s*ИНН|\s*р/с|\s*$)'
+        # ИНН может быть: "ИНН: 1234567890" или "ИНН/КПП: 1234567890/123456789" или просто "1234567890/123456789"
+        inn_pattern = r'(?:ИНН[/КПП\s:]*)?(\d{10}|\d{12})(?:[/\s](\d{9}))?'
         kpp_pattern = r'КПП[:\s]*(\d{9})'
+        # Паттерн для формата ИНН/КПП (например "7799763198/779901001")
+        inn_kpp_combined = r'\b(\d{10})/(\d{9})\b'
 
-        # Контекстные маркеры для продавца
-        seller_markers = ['продавец', 'поставщик', 'грузоотправитель', 'исполнитель', 'подрядчик']
-        buyer_markers = ['покупатель', 'плательщик', 'грузополучатель', 'заказчик']
+        # Контекстные маркеры (с учётом OCR-ошибок)
+        seller_markers = ['продавец', 'поставщик', 'грузоотправитель', 'груз0отправитель', 'исполнитель', 'подрядчик']
+        buyer_markers = ['покупатель', 'покупатоль', 'покупат', 'плательщик', 'платель', 'грузополучатель', 'груз0получатель', 'грузопол', 'заказчик']
 
-        lines = full_text.split('\n')
+        lines = [s for s in rec_texts if isinstance(s, str)]
 
-        # Ищем блоки текста, связанные с продавцом и покупателем
-        current_party = None  # 'seller' или 'buyer'
-        found_seller_inn = None
-        found_seller_name = None
-        found_seller_kpp = None
-        found_buyer_inn = None
-        found_buyer_name = None
-        found_buyer_kpp = None
+        # Структура для хранения найденных организаций
+        # Каждая запись: {line_idx, name, inn, kpp, role: 'seller'|'buyer'|None}
+        orgs_found = []
 
-        for i, line in enumerate(lines):
-            line_lower = line.lower()
+        def _is_garbage_name(name: str) -> bool:
+            """Проверка на мусорное название."""
+            name_lower = name.lower()
+            # Банки - пропускаем
+            is_bank = any(b in name_lower for b in ['банк', 'сбербанк', 'bank', 'втб', 'альфа', 'тинькофф', 'газпромбанк'])
+            # Служебные фразы из OCR
+            is_service = any(s in name_lower for s in ['реквизит', 'рекв', 'реки', 'адрес', 'телефон', 'факс', 'подразделение', 'нков', 'ковск'])
+            # Слишком короткое или не содержит букв
+            is_garbage = len(name) < 5 or not re.search(r'[а-яА-Яa-zA-Z]{3,}', name)
+            # Название состоит только из цифр после префикса (например "ООО 00047")
+            name_after_prefix = re.sub(r'^[ОоOo0]{3}\s*', '', name, flags=re.IGNORECASE).strip()
+            is_only_digits = bool(re.match(r'^[\d\s]+$', name_after_prefix))
+            return is_bank or is_service or is_garbage or is_only_digits
 
-            # Определяем контекст по маркерам (смотрим также на соседние строки)
-            context_window = line_lower
-            if i > 0:
-                context_window = lines[i-1].lower() + " " + context_window
-            if i < len(lines) - 1:
-                context_window += " " + lines[i+1].lower()
+        def _normalize_org_name(name: str) -> str:
+            """Нормализация названия организации."""
+            # Нормализуем все варианты OCR-ошибок в ООО
+            # [ОоOo0]{3} -> ООО
+            name = re.sub(r'^[ОоOo0]{3}\s*', 'ООО ', name, flags=re.IGNORECASE)
+            # Убираем двойные пробелы
+            name = re.sub(r'\s+', ' ', name)
+            # Нормализуем кавычки
+            name = re.sub(r'["\«\»]', '"', name)
+            return name.strip()
 
-            for marker in seller_markers:
-                if marker in context_window:
-                    current_party = 'seller'
-                    break
+        def _get_role_from_context(line_idx: int, lines: list) -> Optional[str]:
+            """Определение роли (seller/buyer) по контексту строки."""
+            current_line = lines[line_idx].lower() if 0 <= line_idx < len(lines) else ""
+
+            # Функция для проверки что маркер НЕ является частью названия организации
+            def _is_marker_not_in_org_name(line: str, marker: str) -> bool:
+                """Проверяет что маркер - это метка поля, а не часть названия ООО."""
+                line_lower = line.lower()
+                # Если маркер идёт ПЕРЕД названием организации (ООО/ЗАО и т.д.) - это метка
+                # Например: "Продавец: ООО Рога" или "Покупатель ООО Копыта"
+                marker_pos = line_lower.find(marker)
+                if marker_pos == -1:
+                    return False
+                # Ищем ООО/ЗАО и т.д. после маркера
+                org_match = re.search(r'[ОоOo0]{3}|ЗАО|ПАО|АО', line_lower[marker_pos:], re.IGNORECASE)
+                if org_match:
+                    # Маркер перед org - это метка поля
+                    return True
+                # Проверяем что маркер не внутри названия типа "ООО Поставщик 1"
+                org_in_line = re.search(rf'[ОоOo0]{{3}}\s*["\«]?[^"\»,\n]*{marker}', line_lower)
+                if org_in_line:
+                    # Маркер внутри названия организации - игнорируем
+                    return False
+                return True
+
+            # Проверяем маркеры в самой строке сначала
             for marker in buyer_markers:
-                if marker in context_window:
-                    current_party = 'buyer'
-                    break
+                if marker in current_line and _is_marker_not_in_org_name(current_line, marker):
+                    return 'buyer'
+            for marker in seller_markers:
+                if marker in current_line and _is_marker_not_in_org_name(current_line, marker):
+                    return 'seller'
 
-            # Ищем ИНН в текущей строке
-            inn_match = re.search(inn_pattern, line, re.IGNORECASE)
-            if inn_match:
-                inn = inn_match.group(1)
-                # Проверяем контекст конкретно для этой строки
-                line_is_seller = any(m in line_lower for m in seller_markers)
-                line_is_buyer = any(m in line_lower for m in buyer_markers)
+            # Собираем контекст из соседних строк (без текущей)
+            for offset in [-1, 1, -2, 2]:  # проверяем ближайшие сначала
+                idx = line_idx + offset
+                if 0 <= idx < len(lines):
+                    neighbor = lines[idx].lower()
+                    # Пропускаем строки которые содержат org в начале (это другие организации)
+                    # Используем \b чтобы не путать "000" в номерах счетов с "ООО"
+                    if re.search(r'^\s*(?:[ОоOo0]{3}|ЗАО|ПАО|ОАО)\s*["\«]?\w', neighbor, re.IGNORECASE):
+                        continue
+                    for marker in buyer_markers:
+                        if marker in neighbor:
+                            return 'buyer'
+                    for marker in seller_markers:
+                        if marker in neighbor:
+                            return 'seller'
 
-                if line_is_buyer or current_party == 'buyer':
-                    if not found_buyer_inn:
-                        found_buyer_inn = inn
-                        current_party = 'buyer'
-                elif line_is_seller or current_party == 'seller':
-                    if not found_seller_inn:
-                        found_seller_inn = inn
-                        current_party = 'seller'
-                elif not found_seller_inn:
-                    # Первый ИНН - продавец
-                    found_seller_inn = inn
-                    current_party = 'seller'
-                elif not found_buyer_inn:
-                    # Второй ИНН - покупатель
-                    found_buyer_inn = inn
-                    current_party = 'buyer'
+            return None
 
-            # Ищем КПП
-            kpp_match = re.search(kpp_pattern, line, re.IGNORECASE)
-            if kpp_match:
-                kpp = kpp_match.group(1)
-                if current_party == 'seller' and not found_seller_kpp:
-                    found_seller_kpp = kpp
-                elif current_party == 'buyer' and not found_buyer_kpp:
-                    found_buyer_kpp = kpp
+        # Вспомогательная функция для извлечения ИНН/КПП из строки
+        def _extract_inn_kpp(line: str) -> tuple:
+            """Извлечение ИНН и КПП из строки."""
+            # Сначала пробуем формат ИНН/КПП (7799763198/779901001)
+            combined = re.search(inn_kpp_combined, line)
+            if combined:
+                return combined.group(1), combined.group(2)
+            # Потом пробуем формат "ИНН: 1234567890"
+            inn_m = re.search(r'ИНН[:\s]*(\d{10}|\d{12})', line, re.IGNORECASE)
+            if inn_m:
+                inn = inn_m.group(1)
+                kpp_m = re.search(kpp_pattern, line, re.IGNORECASE)
+                kpp = kpp_m.group(1) if kpp_m else None
+                return inn, kpp
+            return None, None
 
-            # Ищем название организации
+        # Проход 1: Ищем строки с org + ИНН вместе (надёжное извлечение)
+        for i, line in enumerate(lines):
             org_match = re.search(org_pattern, line, re.IGNORECASE)
-            if org_match:
-                # Пытаемся взять полное название с типом
-                full_match = re.search(r'((?:ООО|О0О|OOO|ЗАО|ПАО|АО|ОАО|ИП|ФГУП|МУП|НКО|ТОО)\s*["\«]?[^"\»,\n]{2,50}["\»]?)', line, re.IGNORECASE)
-                name = full_match.group(1).strip() if full_match else org_match.group(0).strip()
-                # Нормализуем OCR-ошибки в названии типа организации
-                name = re.sub(r'^О0О', 'ООО', name)
-                name = re.sub(r'^OOO', 'ООО', name)
-                # Очищаем от кавычек
-                name = re.sub(r'["\«\»]', '"', name)
+            inn, kpp = _extract_inn_kpp(line)
 
-                # Пропускаем банки и служебные фразы
-                name_lower = name.lower()
-                is_bank = any(b in name_lower for b in ['банк', 'сбербанк', 'bank', 'втб', 'альфа', 'тинькофф', 'газпромбанк'])
-                is_service = any(s in name_lower for s in ['реквизит', 'адрес', 'телефон', 'факс', 'подразделение'])
-                if is_bank or is_service:
+            if org_match and inn:
+                name = _normalize_org_name(org_match.group(1))
+                if _is_garbage_name(name):
                     continue
 
-                if current_party == 'seller' and not found_seller_name:
-                    found_seller_name = name
-                elif current_party == 'buyer' and not found_buyer_name:
-                    found_buyer_name = name
-                elif not found_seller_name:
-                    found_seller_name = name
-                elif not found_buyer_name:
-                    found_buyer_name = name
+                role = _get_role_from_context(i, lines)
 
-        result["seller_name"] = found_seller_name
-        result["seller_inn"] = found_seller_inn
-        result["seller_kpp"] = found_seller_kpp
-        result["buyer_name"] = found_buyer_name
-        result["buyer_inn"] = found_buyer_inn
-        result["buyer_kpp"] = found_buyer_kpp
+                orgs_found.append({
+                    'line_idx': i,
+                    'name': name,
+                    'inn': inn,
+                    'kpp': kpp,
+                    'role': role,
+                    'has_inn_in_line': True
+                })
+
+        # Проход 2: Ищем отдельные org (без ИНН в той же строке)
+        for i, line in enumerate(lines):
+            # Пропускаем если уже нашли org+inn в этой строке
+            if any(o['line_idx'] == i for o in orgs_found):
+                continue
+
+            org_match = re.search(org_pattern, line, re.IGNORECASE)
+            if org_match:
+                name = _normalize_org_name(org_match.group(1))
+                if _is_garbage_name(name):
+                    continue
+
+                # Определяем роль по контексту
+                role = _get_role_from_context(i, lines)
+
+                # Ищем ИНН в соседних строках (±10 для УПД где ИНН может быть далеко)
+                nearby_inn = None
+                nearby_kpp = None
+                for offset in range(-10, 11):
+                    idx = i + offset
+                    if 0 <= idx < len(lines) and idx != i:
+                        inn, kpp = _extract_inn_kpp(lines[idx])
+                        if inn:
+                            # Проверяем что ИНН не принадлежит другой организации
+                            # Для этого смотрим контекст строки с ИНН
+                            inn_role = _get_role_from_context(idx, lines)
+                            # Если роли совпадают или одна из них None - ИНН подходит
+                            if inn_role == role or inn_role is None or role is None:
+                                nearby_inn = inn
+                                nearby_kpp = kpp
+                                break
+
+                # Добавляем только если нет дубликата по имени
+                if not any(o['name'] == name for o in orgs_found):
+                    orgs_found.append({
+                        'line_idx': i,
+                        'name': name,
+                        'inn': nearby_inn,
+                        'kpp': nearby_kpp,
+                        'role': role,
+                        'has_inn_in_line': False
+                    })
+
+        # Распределяем роли
+        # Приоритет: явно определённые роли > порядок появления
+        sellers = [o for o in orgs_found if o['role'] == 'seller']
+        buyers = [o for o in orgs_found if o['role'] == 'buyer']
+        unknowns = [o for o in orgs_found if o['role'] is None]
+
+        # Выбираем seller
+        if sellers:
+            # Предпочитаем org с ИНН в той же строке
+            sellers_with_inn = [s for s in sellers if s['has_inn_in_line']]
+            best_seller = sellers_with_inn[0] if sellers_with_inn else sellers[0]
+            result["seller_name"] = best_seller['name']
+            result["seller_inn"] = best_seller['inn']
+            result["seller_kpp"] = best_seller['kpp']
+        elif unknowns:
+            # Первый unknown становится seller
+            best_seller = unknowns[0]
+            result["seller_name"] = best_seller['name']
+            result["seller_inn"] = best_seller['inn']
+            result["seller_kpp"] = best_seller['kpp']
+            unknowns = unknowns[1:]  # Убираем из списка
+
+        # Выбираем buyer
+        if buyers:
+            # Предпочитаем org с ИНН в той же строке
+            buyers_with_inn = [b for b in buyers if b['has_inn_in_line']]
+            best_buyer = buyers_with_inn[0] if buyers_with_inn else buyers[0]
+            result["buyer_name"] = best_buyer['name']
+            result["buyer_inn"] = best_buyer['inn']
+            result["buyer_kpp"] = best_buyer['kpp']
+        elif unknowns:
+            # Следующий unknown становится buyer
+            best_buyer = unknowns[0]
+            result["buyer_name"] = best_buyer['name']
+            result["buyer_inn"] = best_buyer['inn']
+            result["buyer_kpp"] = best_buyer['kpp']
 
     except Exception:
         pass
@@ -326,14 +434,125 @@ def _extract_doc_info_from_ocr(raw: dict) -> Dict[str, Any]:
                             break
 
         # Fallback: ищем дату в формате DD.MM.20XX (современные документы)
+        # Но исключаем даты из строк "Основание", "от", "договор" - это не дата документа
         if not result["doc_date"]:
             modern_date_pattern = r'\b(\d{1,2}[./]\d{1,2}[./]20\d{2})\b'
-            for line in rec_texts:
+            for i, line in enumerate(rec_texts):
                 if isinstance(line, str):
+                    line_lower = line.lower()
+                    # Пропускаем строки с "основание", "от", "договор" - это даты договоров
+                    if 'основание' in line_lower or ' от ' in line_lower or 'договор' in line_lower:
+                        continue
+                    # Пропускаем строки с годом в формате "1812 года" (адреса)
+                    if 'года ул' in line_lower or 'год ул' in line_lower:
+                        continue
                     date_match = re.search(modern_date_pattern, line)
                     if date_match:
                         result["doc_date"] = date_match.group(1)
                         break
+
+    except Exception:
+        pass
+
+    return result
+
+
+def _extract_totals_from_ocr(raw: dict) -> Dict[str, Any]:
+    """Извлечение итоговых сумм из OCR текста.
+
+    Ищет паттерны:
+    - "Всего к оплате" / "Итого" с последующими суммами
+    - Суммы в формате 1234,56 или 1 234,56
+    """
+    result = {
+        "total_amount": None,      # Сумма без НДС
+        "total_nds": None,         # Сумма НДС
+        "total_with_nds": None,    # Итого с НДС
+    }
+
+    try:
+        ocr_raw = raw.get("ocr_raw", {})
+        if not isinstance(ocr_raw, dict):
+            return result
+        rec_texts = ocr_raw.get("rec_texts", [])
+        if not isinstance(rec_texts, list):
+            return result
+
+        def _parse_amount(s: str) -> Optional[float]:
+            """Парсинг суммы из строки. Возвращает None для количеств (целых чисел)."""
+            if not s:
+                return None
+            s = s.strip()
+            # Пропускаем числа вида "15,000" или "15.000" - это количество, не сумма
+            # Суммы обычно имеют формат "2500,00" или "2 500,00"
+            if re.match(r'^\d+[,.]000$', s):
+                return None  # Это количество (15,000 = 15 штук)
+            # Убираем пробелы между цифрами (4 200,00 -> 4200,00)
+            s = re.sub(r'(\d)\s+(\d)', r'\1\2', s)
+            # Заменяем запятую на точку
+            s = s.replace(',', '.')
+            # Убираем всё кроме цифр и точки
+            s = re.sub(r'[^\d.]', '', s)
+            try:
+                val = float(s)
+                # Суммы обычно > 1 (копейки есть)
+                return val if val > 0 else None
+            except:
+                return None
+
+        # Ищем маркеры итогов
+        total_markers = ['всего к оплате', 'итого', 'всего по документу', 'общая сумма']
+
+        for i, line in enumerate(rec_texts):
+            if not isinstance(line, str):
+                continue
+            line_lower = line.lower()
+
+            # Проверяем маркеры итогов
+            is_total_line = any(m in line_lower for m in total_markers)
+
+            if is_total_line:
+                # Ищем суммы в следующих строках (обычно 3 значения: без НДС, НДС, с НДС)
+                amounts_found = []
+                for j in range(i + 1, min(i + 10, len(rec_texts))):
+                    next_line = rec_texts[j] if isinstance(rec_texts[j], str) else ""
+                    # Пропускаем строки-маркеры (X, -, и т.д.)
+                    if next_line.strip() in ['X', 'x', 'Х', 'х', '-', '.']:
+                        continue
+                    # Ищем число в строке
+                    amount = _parse_amount(next_line)
+                    if amount and amount > 0:
+                        amounts_found.append(amount)
+                    # Если нашли 3 суммы или встретили текст - выходим
+                    if len(amounts_found) >= 3:
+                        break
+                    if next_line.strip() and not re.search(r'[\d,.]', next_line):
+                        break
+
+                # Присваиваем суммы
+                if len(amounts_found) >= 3:
+                    # Стандартный порядок: без НДС, НДС, с НДС
+                    result["total_amount"] = amounts_found[0]
+                    result["total_nds"] = amounts_found[1]
+                    result["total_with_nds"] = amounts_found[2]
+                elif len(amounts_found) == 2:
+                    # Возможно только НДС и итого
+                    result["total_nds"] = amounts_found[0]
+                    result["total_with_nds"] = amounts_found[1]
+                elif len(amounts_found) == 1:
+                    result["total_with_nds"] = amounts_found[0]
+
+                if result["total_with_nds"]:
+                    break  # Нашли итоги
+
+        # Fallback: ищем паттерн "Итого: X руб" в тексте
+        if not result["total_with_nds"]:
+            full_text = " ".join(s for s in rec_texts if isinstance(s, str))
+            # Ищем суммы с валютой
+            amount_pattern = r'(?:итого|всего)[:\s]*(\d[\d\s]*[.,]\d{2})\s*(?:руб|₽)?'
+            match = re.search(amount_pattern, full_text, re.IGNORECASE)
+            if match:
+                result["total_with_nds"] = _parse_amount(match.group(1))
 
     except Exception:
         pass
@@ -854,6 +1073,16 @@ def extract_without_llm(raw: dict) -> StructuredDocument:
                 fields.total_amount = table_totals["total_amount"]
 
     fields.items = all_items
+
+    # Fallback: извлекаем итоги напрямую из OCR текста если не нашли в таблицах
+    if not fields.total_with_nds or not fields.total_nds or not fields.total_amount:
+        ocr_totals = _extract_totals_from_ocr(raw)
+        if not fields.total_amount and ocr_totals.get("total_amount"):
+            fields.total_amount = ocr_totals["total_amount"]
+        if not fields.total_nds and ocr_totals.get("total_nds"):
+            fields.total_nds = ocr_totals["total_nds"]
+        if not fields.total_with_nds and ocr_totals.get("total_with_nds"):
+            fields.total_with_nds = ocr_totals["total_with_nds"]
 
     # Валидация
     if not fields.doc_type:
