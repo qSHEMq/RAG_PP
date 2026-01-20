@@ -19,6 +19,133 @@ from schemas import DocumentFields, StructuredDocument, PartyInfo, TableItem
 from table_parser import parse_table_items, extract_totals
 
 
+def _build_grid_from_ocr_boxes(raw: dict) -> list:
+    """Построение grid-таблицы из OCR с использованием координат (rec_boxes).
+
+    Группирует тексты по Y-координатам, сортирует по X.
+    Ищет товарные позиции по паттернам (номер, наименование, цена, количество).
+    Возвращает список grid'ов.
+    """
+    grids = []
+    try:
+        ocr_raw = raw.get("ocr_raw", {}) or {}
+        rec_texts = ocr_raw.get("rec_texts", []) or []
+        rec_boxes = ocr_raw.get("rec_boxes", []) or []
+
+        if not rec_texts or not rec_boxes or len(rec_texts) != len(rec_boxes):
+            return grids
+
+        # Собираем пары (текст, box) где box = [x1, y1, x2, y2]
+        items = []
+        for text, box in zip(rec_texts, rec_boxes):
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if not isinstance(box, (list, tuple)) or len(box) < 4:
+                continue
+            x1, y1, x2, y2 = box[:4]
+            y_center = (y1 + y2) / 2
+            x_center = (x1 + x2) / 2
+            height = abs(y2 - y1)
+            items.append({
+                "text": text.strip(),
+                "x": x_center,
+                "y": y_center,
+                "y1": y1,
+                "y2": y2,
+                "height": height,
+            })
+
+        if not items:
+            return grids
+
+        # Вычисляем медианную высоту текста для порога
+        heights = [it["height"] for it in items if it["height"] > 5]
+        median_height = sorted(heights)[len(heights) // 2] if heights else 20
+
+        # Сортируем по Y, затем по X
+        items.sort(key=lambda it: (it["y"], it["x"]))
+
+        # Группируем по Y (строки) с адаптивным порогом
+        rows = []
+        current_row = [items[0]]
+        for item in items[1:]:
+            prev_y = current_row[-1]["y"]
+            # Порог = половина медианной высоты текста
+            threshold = median_height * 0.5
+            if abs(item["y"] - prev_y) <= threshold:
+                current_row.append(item)
+            else:
+                current_row.sort(key=lambda it: it["x"])
+                rows.append(current_row)
+                current_row = [item]
+        if current_row:
+            current_row.sort(key=lambda it: it["x"])
+            rows.append(current_row)
+
+        # Ищем строки товарных позиций
+        # Признаки: содержит числа с десятичной частью (цена/сумма) И название товара
+        table_rows = []
+        skip_keywords = ['форма', 'утвержден', 'постановлен', 'госкомстат', 'окуд', 'окпо',
+                         'грузоотправитель', 'грузополучатель', 'поставщик', 'плательщик',
+                         'основание', 'договор', 'накладная', 'транспортная', 'вид операции']
+
+        for row_items in rows:
+            row_texts = [it["text"] for it in row_items]
+            row_text_lower = " ".join(row_texts).lower()
+
+            # Пропускаем служебные строки
+            if any(kw in row_text_lower for kw in skip_keywords):
+                continue
+
+            # Считаем числа с десятичной частью (цена, сумма)
+            decimal_numbers = re.findall(r'\d+[,\.]\d{2}', " ".join(row_texts))
+            # Считаем процентные ставки
+            has_percent = bool(re.search(r'\d{1,2}\s*%', " ".join(row_texts)))
+
+            # Товарная строка: >= 2 десятичных числа ИЛИ (1 число + процент)
+            if len(decimal_numbers) >= 2 or (len(decimal_numbers) >= 1 and has_percent):
+                table_rows.append(row_texts)
+
+        if len(table_rows) >= 1:
+            # Нормализуем в прямоугольный grid
+            max_cols = max(len(r) for r in table_rows)
+            grid = [[r[i] if i < len(r) else "" for i in range(max_cols)] for r in table_rows]
+
+            # Добавляем заголовок для ТОРГ-12/УПД если его нет
+            # Стандартный порядок: №, Наименование, Ед.изм, Код ОКЕИ, Кол-во, Цена, Сумма без НДС, Ставка НДС, Сумма НДС, Сумма с НДС
+            if max_cols >= 6:
+                header = ["№ п/п", "Наименование", "Ед.изм", "Код ОКЕИ", "Количество", "Цена",
+                          "Сумма без НДС", "Ставка НДС", "Сумма НДС", "Сумма с НДС"][:max_cols]
+                # Проверяем, есть ли уже заголовок (первая строка не содержит чисел)
+                first_row_text = " ".join(str(c) for c in grid[0])
+                has_header = not bool(re.search(r'\d+[,\.]\d{2}', first_row_text))
+                if not has_header:
+                    grid.insert(0, header + [""] * (max_cols - len(header)))
+
+            grids.append(grid)
+
+        # Сохраняем debug
+        try:
+            src = raw.get("source", {}).get("name", "doc")
+            out_dir = Path("output") / str(src)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # Сохраняем все строки для отладки
+            all_rows = [[it["text"] for it in row] for row in rows]
+            (out_dir / "ocr_boxes_all_rows.json").write_text(
+                json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            if grids:
+                (out_dir / "ocr_boxes_grid.json").write_text(
+                    json.dumps(grids, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+    return grids
+
+
 def _build_grid_from_ocr_texts(raw: dict) -> list:
     """Попытка собрать grid-таблицу из OCR-текстов как fallback.
 
@@ -135,9 +262,11 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
         "seller_name": None,
         "seller_inn": None,
         "seller_kpp": None,
+        "seller_address": None,
         "buyer_name": None,
         "buyer_inn": None,
         "buyer_kpp": None,
+        "buyer_address": None,
     }
 
     try:
@@ -261,6 +390,129 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
                 return inn, kpp
             return None, None
 
+        def _extract_address(line: str) -> Optional[str]:
+            """Извлечение адреса из строки.
+
+            Адрес обычно находится после ИНН и перед банковскими реквизитами.
+            Формат: 142770, Москва г, МКАД 40-й км, владение № 1, строение 2
+            """
+            if re.search(r'грузоотправител|грузополучател', line, re.IGNORECASE):
+                return None
+            # Убираем маркеры адреса в начале строки
+            line = re.sub(r'^\s*\(?\s*\d*[аa]?\s*\)?\s*адрес[:\s]*', '', line, flags=re.IGNORECASE)
+            # Убираем часть до ИНН (включая ИНН и КПП)
+            # Паттерн: ИНН 1234567890 или ИНН 1234567890/123456789
+            line_after_inn = re.sub(
+                r'^.*?ИНН[:\s/]*\d{10,12}(?:[/\s]*\d{9})?[,\s]*',
+                '',
+                line,
+                flags=re.IGNORECASE
+            )
+
+            if not line_after_inn or line_after_inn == line:
+                # ИНН не найден, пробуем искать адрес по индексу
+                # Индекс: 6 цифр в начале (142770, ...)
+                idx_match = re.search(r'\b(\d{6})[,\s]+', line)
+                if idx_match:
+                    line_after_inn = line[idx_match.start():]
+                else:
+                    # Если индекса нет, но строка похожа на адрес — используем её как есть
+                    has_city = bool(re.search(
+                        r'\b(г\.|город|Москва|Санкт-Петербург|обл\.|область|край|респ\.|ул\.|улица|пр\.|просп|д\.|дом|стр\.|строение|км|владение)',
+                        line,
+                        re.IGNORECASE
+                    ))
+                    if has_city and len(line.strip()) >= 10:
+                        line_after_inn = line
+                    else:
+                        return None
+
+            # Обрезаем до банковских реквизитов и телефона
+            # р/с, р.с., расч, в банке, БИК, к/с, корр, тел
+            bank_markers = r'(?:р/с|р\.с\.|р\s*/\s*с|расч|в\s+банке|БИК|к/с|к\.с\.|корр|ОГРН|тел[\.:\s]|факс)'
+            parts = re.split(bank_markers, line_after_inn, flags=re.IGNORECASE)
+            address_part = parts[0].strip() if parts else ""
+
+            # Очищаем адрес
+            # Убираем запятую в конце
+            address_part = address_part.rstrip(',').rstrip()
+
+            # Проверяем что это похоже на адрес (есть индекс или город)
+            has_index = bool(re.search(r'\b\d{6}\b', address_part))
+            has_city = bool(re.search(
+                r'\b(г\.|город|Москва|Санкт-Петербург|обл\.|область|край|респ\.|ул\.|улица|пр\.|просп|д\.|дом|стр\.|строение|км|владение)',
+                address_part,
+                re.IGNORECASE
+            ))
+
+            if (has_index or has_city) and len(address_part) >= 10:
+                return address_part
+
+            return None
+
+        def _extract_addresses_from_markers(lines: list) -> Dict[str, Optional[str]]:
+            """UPD-логика: извлекает адреса по маркерам 'Адрес:' и '(2a) Адрес:'."""
+            found = {"seller_address": None, "buyer_address": None}
+            unknown = []
+
+            def _is_address_value(text: str) -> Optional[str]:
+                if not text:
+                    return None
+                if re.search(r'(ИНН|КПП|р/с|БИК|к/с|продавец|покупатель|статус|валюта|грузоотправител|грузополучател)', text, re.IGNORECASE):
+                    return None
+                return _extract_address(text)
+
+            for i, line in enumerate(lines):
+                if not isinstance(line, str):
+                    continue
+                low = line.lower()
+                if "адрес" not in low:
+                    continue
+                if "грузоотправител" in low or "грузополучател" in low:
+                    continue
+
+                role_hint = None
+                if re.search(r'\(2\s*[аa]\)|\b2\s*[аa]\b', low):
+                    role_hint = "buyer"
+                elif "продавец" in low:
+                    role_hint = "seller"
+                elif "покупатель" in low or "покупат" in low:
+                    role_hint = "buyer"
+                else:
+                    role_hint = _get_role_from_context(i, lines)
+
+                addr_inline = _is_address_value(re.sub(r'^.*адрес[:\s]*', '', line, flags=re.IGNORECASE))
+                addr = addr_inline
+
+                if not addr:
+                    for j in range(i + 1, min(len(lines), i + 10)):
+                        addr = _is_address_value(lines[j])
+                        if addr:
+                            break
+
+                if not addr:
+                    for j in range(max(0, i - 8), i):
+                        addr = _is_address_value(lines[j])
+                        if addr:
+                            break
+
+                if addr:
+                    if role_hint == "seller":
+                        if not found["seller_address"]:
+                            found["seller_address"] = addr
+                    elif role_hint == "buyer":
+                        if not found["buyer_address"]:
+                            found["buyer_address"] = addr
+                    else:
+                        unknown.append(addr)
+
+            for addr in unknown:
+                if not found["seller_address"]:
+                    found["seller_address"] = addr
+                elif not found["buyer_address"]:
+                    found["buyer_address"] = addr
+            return found
+
         # Проход 1: Ищем строки с org + ИНН вместе (надёжное извлечение)
         for i, line in enumerate(lines):
             org_match = re.search(org_pattern, line, re.IGNORECASE)
@@ -272,12 +524,14 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
                     continue
 
                 role = _get_role_from_context(i, lines)
+                address = _extract_address(line)
 
                 orgs_found.append({
                     'line_idx': i,
                     'name': name,
                     'inn': inn,
                     'kpp': kpp,
+                    'address': address,
                     'role': role,
                     'has_inn_in_line': True
                 })
@@ -297,9 +551,10 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
                 # Определяем роль по контексту
                 role = _get_role_from_context(i, lines)
 
-                # Ищем ИНН в соседних строках (±10 для УПД где ИНН может быть далеко)
+                # Ищем ИНН и адрес в соседних строках (±10 для УПД где ИНН может быть далеко)
                 nearby_inn = None
                 nearby_kpp = None
+                nearby_address = None
                 for offset in range(-10, 11):
                     idx = i + offset
                     if 0 <= idx < len(lines) and idx != i:
@@ -312,6 +567,8 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
                             if inn_role == role or inn_role is None or role is None:
                                 nearby_inn = inn
                                 nearby_kpp = kpp
+                                # Извлекаем адрес из строки с ИНН
+                                nearby_address = _extract_address(lines[idx])
                                 break
 
                 # Добавляем только если нет дубликата по имени
@@ -321,6 +578,7 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
                         'name': name,
                         'inn': nearby_inn,
                         'kpp': nearby_kpp,
+                        'address': nearby_address,
                         'role': role,
                         'has_inn_in_line': False
                     })
@@ -339,12 +597,14 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
             result["seller_name"] = best_seller['name']
             result["seller_inn"] = best_seller['inn']
             result["seller_kpp"] = best_seller['kpp']
+            result["seller_address"] = best_seller.get('address')
         elif unknowns:
             # Первый unknown становится seller
             best_seller = unknowns[0]
             result["seller_name"] = best_seller['name']
             result["seller_inn"] = best_seller['inn']
             result["seller_kpp"] = best_seller['kpp']
+            result["seller_address"] = best_seller.get('address')
             unknowns = unknowns[1:]  # Убираем из списка
 
         # Выбираем buyer
@@ -355,12 +615,24 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
             result["buyer_name"] = best_buyer['name']
             result["buyer_inn"] = best_buyer['inn']
             result["buyer_kpp"] = best_buyer['kpp']
+            result["buyer_address"] = best_buyer.get('address')
         elif unknowns:
             # Следующий unknown становится buyer
             best_buyer = unknowns[0]
             result["buyer_name"] = best_buyer['name']
             result["buyer_inn"] = best_buyer['inn']
             result["buyer_kpp"] = best_buyer['kpp']
+            result["buyer_address"] = best_buyer.get('address')
+
+        # UPD: добираем адреса по маркерам, если они не определились
+        try:
+            marker_addresses = _extract_addresses_from_markers(lines)
+            if not result.get("seller_address") and marker_addresses.get("seller_address"):
+                result["seller_address"] = marker_addresses["seller_address"]
+            if not result.get("buyer_address") and marker_addresses.get("buyer_address"):
+                result["buyer_address"] = marker_addresses["buyer_address"]
+        except Exception:
+            pass
 
     except Exception:
         pass
@@ -558,6 +830,136 @@ def _extract_totals_from_ocr(raw: dict) -> Dict[str, Any]:
         pass
 
     return result
+
+
+def _extract_contract_from_ocr(raw: dict) -> Dict[str, Any]:
+    """Извлечение номера и даты договора/основания из OCR текста.
+
+    Ищет паттерны:
+    - "Основание 123456 от 01.01.2025"
+    - "Договор № 123 от 01.01.2025"
+    - "Заказ № 123 от 01.01.2025"
+    """
+    result = {
+        "contract_number": None,
+        "contract_date": None,
+    }
+
+    try:
+        ocr_raw = raw.get("ocr_raw", {})
+        if not isinstance(ocr_raw, dict):
+            return result
+        rec_texts = ocr_raw.get("rec_texts", [])
+        if not isinstance(rec_texts, list):
+            return result
+
+        # Паттерны для поиска
+        # "Основание 201016 от 10.01.2025" или "Договор № 123 от 01.01.2025"
+        contract_pattern = r'(?:основание|договор|заказ|контракт|соглашение)[:\s№]*(\d+[-/\d]*)\s*(?:от\s*)?(\d{1,2}[./]\d{1,2}[./]\d{2,4})?'
+        # Альтернативный: "№ 123 от 01.01.2025" после ключевого слова
+        alt_pattern = r'(?:основание|договор|заказ)[:\s]*[№#]?\s*(\d+[-/\w]*)\s+от\s+(\d{1,2}[./]\d{1,2}[./]\d{2,4})'
+
+        for line in rec_texts:
+            if not isinstance(line, str):
+                continue
+            line_lower = line.lower()
+
+            # Пропускаем строки с "без договора"
+            if 'без договора' in line_lower:
+                continue
+
+            # Пробуем альтернативный паттерн (более точный)
+            match = re.search(alt_pattern, line, re.IGNORECASE)
+            if match:
+                result["contract_number"] = match.group(1).strip()
+                result["contract_date"] = match.group(2)
+                break
+
+            # Основной паттерн
+            match = re.search(contract_pattern, line, re.IGNORECASE)
+            if match:
+                result["contract_number"] = match.group(1).strip()
+                if match.group(2):
+                    result["contract_date"] = match.group(2)
+                break
+
+    except Exception:
+        pass
+
+    return result
+
+
+def _extract_currency_from_ocr(raw: dict) -> Optional[str]:
+    """Извлечение валюты документа из OCR текста.
+
+    Ищет: руб, рубль, RUB, USD, EUR, ₽, $, €
+    """
+    try:
+        ocr_raw = raw.get("ocr_raw", {})
+        if not isinstance(ocr_raw, dict):
+            return None
+        rec_texts = ocr_raw.get("rec_texts", [])
+        if not isinstance(rec_texts, list):
+            return None
+
+        full_text = " ".join(s for s in rec_texts if isinstance(s, str))
+        full_lower = full_text.lower()
+
+        # Приоритетный поиск
+        if 'usd' in full_lower or '$' in full_text:
+            return "USD"
+        if 'eur' in full_lower or '€' in full_text:
+            return "EUR"
+        # Рубли - по умолчанию для российских документов
+        if 'руб' in full_lower or '₽' in full_text or 'rub' in full_lower:
+            return "руб."
+
+        # Если есть суммы с ",00" или ".00" - скорее всего рубли
+        if re.search(r'\d+[,\.]\d{2}', full_text):
+            return "руб."
+
+    except Exception:
+        pass
+
+    return None
+
+
+def _extract_nds_rate_from_ocr(raw: dict) -> Optional[str]:
+    """Извлечение основной ставки НДС из документа.
+
+    Ищет: 20%, 10%, 0%, без НДС, НДС не облагается
+    """
+    try:
+        ocr_raw = raw.get("ocr_raw", {})
+        if not isinstance(ocr_raw, dict):
+            return None
+        rec_texts = ocr_raw.get("rec_texts", [])
+        if not isinstance(rec_texts, list):
+            return None
+
+        full_text = " ".join(s for s in rec_texts if isinstance(s, str))
+        full_lower = full_text.lower()
+
+        # Ищем ставки НДС
+        if 'без ндс' in full_lower or 'ндс не облагается' in full_lower or 'не облагается' in full_lower:
+            return "без НДС"
+
+        # Ищем процентные ставки
+        nds_match = re.search(r'(?:ндс|нд[cс])[:\s]*(\d{1,2})\s*%', full_lower)
+        if nds_match:
+            rate = int(nds_match.group(1))
+            if rate in (20, 10, 0):
+                return f"{rate}%"
+
+        # Ищем в формате "20%" рядом с НДС или в колонке таблицы
+        rate_match = re.search(r'\b(20|10|0)\s*%', full_text)
+        if rate_match:
+            return f"{rate_match.group(1)}%"
+
+    except Exception:
+        pass
+
+    return None
 
 
 # --- Промпт для LLM ---
@@ -1029,12 +1431,22 @@ def extract_without_llm(raw: dict) -> StructuredDocument:
         name=parties.get("seller_name"),
         inn=_fix_inn(parties.get("seller_inn")),
         kpp=_fix_kpp(parties.get("seller_kpp")),
+        address=parties.get("seller_address"),
     )
     fields.buyer = PartyInfo(
         name=parties.get("buyer_name"),
         inn=_fix_inn(parties.get("buyer_inn")),
         kpp=_fix_kpp(parties.get("buyer_kpp")),
+        address=parties.get("buyer_address"),
     )
+
+    # Извлекаем договор/основание
+    contract_info = _extract_contract_from_ocr(raw)
+    fields.contract_number = contract_info.get("contract_number")
+    fields.contract_date = _fix_date(contract_info.get("contract_date"))
+
+    # Извлекаем валюту
+    fields.currency = _extract_currency_from_ocr(raw)
 
     # Парсим таблицы
     tables = raw.get("tables", [])
@@ -1057,9 +1469,13 @@ def extract_without_llm(raw: dict) -> StructuredDocument:
             if table_totals.get("total_amount") and not fields.total_amount:
                 fields.total_amount = table_totals["total_amount"]
 
-    # Fallback: если таблиц не найдено — пробуем собрать из OCR-текста
+    # Fallback: если таблиц не найдено — пробуем собрать из OCR с координатами
     if not all_items:
-        fallback_grids = _build_grid_from_ocr_texts(raw)
+        # Сначала пробуем по координатам (rec_boxes) — более точный метод
+        fallback_grids = _build_grid_from_ocr_boxes(raw)
+        # Если не получилось — пробуем по текстам
+        if not fallback_grids:
+            fallback_grids = _build_grid_from_ocr_texts(raw)
         for grid in fallback_grids:
             items = parse_table_items(grid)
             if items:

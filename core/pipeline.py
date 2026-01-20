@@ -148,7 +148,11 @@ class DocumentPipeline:
         res = tsr_raw.get("res") or tsr_raw
         if not isinstance(res, dict):
             return None
-        return res.get("structure") or res.get("html") or res.get("table_html")
+        html = res.get("structure") or res.get("html") or res.get("table_html")
+        # structure может быть списком токенов — объединяем в строку
+        if isinstance(html, list):
+            html = "".join(html)
+        return html
 
     def process_image(self, img: np.ndarray, name: str = "doc") -> dict:
         """
