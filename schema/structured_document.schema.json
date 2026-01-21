@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "StructuredDocument",
+  "type": "object",
+  "required": ["fields", "confidence", "warnings", "errors"],
+  "properties": {
+    "fields": {
+      "type": "object",
+      "properties": {
+        "doc_type": {"type":["string","null"]},
+        "doc_number": {"type":["string","null"]},
+        "doc_date": {"type":["string","null"]},
+        "sf_number": {"type":["string","null"]},
+        "sf_date": {"type":["string","null"]},
+        "correction_number": {"type":["string","null"]},
+        "correction_date": {"type":["string","null"]},
+        "seller": {
+          "type": "object",
+          "properties": {
+            "name": {"type":["string","null"]},
+            "inn": {"type":["string","null"]},
+            "kpp": {"type":["string","null"]},
+            "address": {"type":["string","null"]},
+            "bank_account": {"type":["string","null"]},
+            "bank_name": {"type":["string","null"]},
+            "bik": {"type":["string","null"]},
+            "corr_account": {"type":["string","null"]}
+          }
+        },
+        "buyer": {
+          "type": "object",
+          "properties": {
+            "name": {"type":["string","null"]},
+            "inn": {"type":["string","null"]},
+            "kpp": {"type":["string","null"]},
+            "address": {"type":["string","null"]}
+          }
+        },
+        "consignor": {"type":["string","null"]},
+        "consignee": {"type":["string","null"]},
+        "contract_number": {"type":["string","null"]},
+        "contract_date": {"type":["string","null"]},
+        "total_quantity": {"type":["number","null"]},
+        "total_amount": {"type":["number","null"]},
+        "total_nds": {"type":["number","null"]},
+        "total_with_nds": {"type":["number","null"]},
+        "currency": {"type":["string","null"]},
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "row_num": {"type":["integer","null"]},
+              "name": {"type":["string","null"]},
+              "unit_code": {"type":["string","null"]},
+              "unit_name": {"type":["string","null"]},
+              "quantity": {"type":["number","null"]},
+              "price": {"type":["number","null"]},
+              "amount": {"type":["number","null"]},
+              "nds_rate": {"type":["string","null"]},
+              "nds_amount": {"type":["number","null"]},
+              "total_amount": {"type":["number","null"]}
+            }
+          }
+        }
+      }
+    },
+    "confidence": {"type":"number"},
+    "warnings": {"type":"array","items":{"type":"string"}},
+    "errors": {"type":"array","items":{"type":"string"}}
+  }
+}

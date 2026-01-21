@@ -1,4 +1,0 @@
-# Чисто OCR проверить
-python PaddleOCR\tools\infer\predict_system.py --image_dir "F:\AllnAll\Project_3\OCR\Input" --det_model_dir "F:\AllnAll\Project_3\OCR\PaddleOCR\inference\ch_PP-OCRv3_det_infer" --rec_model_dir "F:\AllnAll\Project_3\OCR\PaddleOCR\inference\cyrillic_PP-OCRv3_rec_infer" --rec_char_dict_path "F:\AllnAll\Project_3\OCR\PaddleOCR\ppocr\utils\dict\cyrillic_dict.txt" --rec_algorithm SVTR --rec_image_shape "3,48,320" --use_gpu false --vis_font_path "C:\Windows\Fonts\arial.ttf" --draw_img_save_dir "F:\AllnAll\Project_3\OCR\Output\ocr_vis"
-
-python F:\AllnAll\Project_3\OCR\postprocess\compare_ocr_metrics.py --ref "F:\AllnAll\Project_3\OCR\Output\ocr_vis_png\system_results.txt" --hyp "F:\AllnAll\Project_3\OCR\Output\ocr_vis_png\rec_results_post.txt"
