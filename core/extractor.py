@@ -288,9 +288,10 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
         # Паттерн для формата ИНН/КПП (например "7799763198/779901001")
         inn_kpp_combined = r'\b(\d{10})/(\d{9})\b'
 
-        # Контекстные маркеры (с учётом OCR-ошибок)
-        seller_markers = ['продавец', 'поставщик', 'грузоотправитель', 'груз0отправитель', 'исполнитель', 'подрядчик']
-        buyer_markers = ['покупатель', 'покупатоль', 'покупат', 'плательщик', 'платель', 'грузополучатель', 'груз0получатель', 'грузопол', 'заказчик']
+        # Контекстные маркеры (с учётом OCR-ошибок и падежей)
+        # Используем корни слов для поиска по всем падежам
+        seller_markers = ['продав', 'поставщ', 'грузоотправ', 'груз0отправ', 'исполнит', 'подрядч']
+        buyer_markers = ['покупат', 'плательщ', 'платель', 'грузополуч', 'груз0получ', 'грузопол', 'заказч']
 
         lines = [s for s in rec_texts if isinstance(s, str)]
 
@@ -357,22 +358,36 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
                     return 'seller'
 
             # Собираем контекст из соседних строк (без текущей)
-            for offset in [-1, 1, -2, 2]:  # проверяем ближайшие сначала
+            # Приоритет: сначала ищем маркер ВЫШЕ (он обычно предшествует значению),
+            # потом ниже. Используем взвешенное расстояние: выше = distance, ниже = distance * 1.5
+            # Маркеры с "ИНН" имеют приоритет (score * 0.5)
+            best_role = None
+            best_score = float('inf')
+            for offset in range(-7, 8):
+                if offset == 0:
+                    continue
                 idx = line_idx + offset
                 if 0 <= idx < len(lines):
                     neighbor = lines[idx].lower()
                     # Пропускаем строки которые содержат org в начале (это другие организации)
-                    # Используем \b чтобы не путать "000" в номерах счетов с "ООО"
                     if re.search(r'^\s*(?:[ОоOo0]{3}|ЗАО|ПАО|ОАО)\s*["\«]?\w', neighbor, re.IGNORECASE):
                         continue
+                    # Взвешенное расстояние: маркеры выше (offset < 0) приоритетнее
+                    base_score = abs(offset) if offset < 0 else abs(offset) * 1.5
+                    # Маркеры с "ИНН" или "инн" имеют приоритет (уменьшаем score)
+                    has_inn_marker = 'инн' in neighbor
+                    score = base_score * 0.5 if has_inn_marker else base_score
+                    # Ищем маркеры и запоминаем лучший по score
                     for marker in buyer_markers:
-                        if marker in neighbor:
-                            return 'buyer'
+                        if marker in neighbor and score < best_score:
+                            best_role = 'buyer'
+                            best_score = score
                     for marker in seller_markers:
-                        if marker in neighbor:
-                            return 'seller'
+                        if marker in neighbor and score < best_score:
+                            best_role = 'seller'
+                            best_score = score
 
-            return None
+            return best_role
 
         # Вспомогательная функция для извлечения ИНН/КПП из строки
         def _extract_inn_kpp(line: str) -> tuple:
@@ -583,6 +598,113 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
                         'has_inn_in_line': False
                     })
 
+        # Проход 3: Ищем организации по маркерам "Продавец:" и "Покупатель:" (без ООО/ЗАО prefix)
+        # Это нужно для случаев типа "Продавец: Арендодатель" или "Продавец:" + "Арендодатель" в след. строке
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            line_lower = line_stripped.lower()
+
+            # Проверяем маркер продавца (с учётом номеров типа "(2) Покупатель:")
+            clean_line = re.sub(r'^\s*\(\d+\)\s*', '', line_lower)  # убираем "(2) " в начале
+            is_seller_marker = re.match(r'^продав[а-я]*[:\s]*$', clean_line) or 'продавец:' in line_lower
+            is_buyer_marker = re.match(r'^покупат[а-я]*[:\s]*$', clean_line) or 'покупатель:' in line_lower
+
+            if is_seller_marker and not any(o['role'] == 'seller' and o['name'] for o in orgs_found):
+                # Ищем название в этой строке после двоеточия или в следующих
+                name = None
+                seller_match = re.search(r'продав[а-я]*[:\s]+(.+)$', line_stripped, re.IGNORECASE)
+                if seller_match:
+                    name = seller_match.group(1).strip()
+                else:
+                    # Ищем название в следующих строках (пропуская служебные)
+                    for j in range(i + 1, min(i + 5, len(lines))):
+                        next_line = lines[j].strip()
+                        # Пропускаем служебные строки
+                        if re.match(r'^(статус|адрес|\(\d|инн|грузо)', next_line, re.IGNORECASE):
+                            continue
+                        if next_line and len(next_line) >= 3:
+                            name = next_line
+                            break
+
+                if name and len(name) >= 3:
+                    name = re.sub(r'\s*ИНН.*$', '', name, flags=re.IGNORECASE).strip()
+                    if name and not _is_garbage_name(name):
+                        orgs_found.append({
+                            'line_idx': i,
+                            'name': name,
+                            'inn': None,
+                            'kpp': None,
+                            'address': None,
+                            'role': 'seller',
+                            'has_inn_in_line': False
+                        })
+
+            if is_buyer_marker and not any(o['role'] == 'buyer' and o['name'] for o in orgs_found):
+                name = None
+                buyer_match = re.search(r'покупат[а-я]*[:\s]+(.+)$', line_stripped, re.IGNORECASE)
+                if buyer_match:
+                    name = buyer_match.group(1).strip()
+                else:
+                    for j in range(i + 1, min(i + 5, len(lines))):
+                        next_line = lines[j].strip()
+                        if re.match(r'^(статус|адрес|\(\d|инн|грузо)', next_line, re.IGNORECASE):
+                            continue
+                        if next_line and len(next_line) >= 3:
+                            name = next_line
+                            break
+
+                if name and len(name) >= 3:
+                    name = re.sub(r'\s*ИНН.*$', '', name, flags=re.IGNORECASE).strip()
+                    if name and not _is_garbage_name(name):
+                        orgs_found.append({
+                            'line_idx': i,
+                            'name': name,
+                            'inn': None,
+                            'kpp': None,
+                            'address': None,
+                            'role': 'buyer',
+                            'has_inn_in_line': False
+                        })
+
+        # Проход 4: Прямой поиск ИНН по маркерам "ИНН/КПП продавца:" и "ИНН/КПП покупателя:"
+        # Это надёжнее чем поиск по близости
+        seller_inn_direct = None
+        seller_kpp_direct = None
+        buyer_inn_direct = None
+        buyer_kpp_direct = None
+        buyer_marker_line = None  # Запоминаем позицию маркера покупателя
+
+        for i, line in enumerate(lines):
+            line_lower = line.lower()
+            # ИНН/КПП продавца (с учётом опечаток типа "ИННкПП", "инн кпп")
+            if ('инн' in line_lower or 'иннкпп' in line_lower) and 'продав' in line_lower:
+                # Ищем ИНН в этой же строке или следующих
+                for j in range(i, min(i + 5, len(lines))):
+                    inn, kpp = _extract_inn_kpp(lines[j])
+                    if inn:
+                        seller_inn_direct = inn
+                        seller_kpp_direct = kpp
+                        break
+            # ИНН/КПП покупателя
+            if ('инн' in line_lower or 'иннкпп' in line_lower) and 'покупат' in line_lower:
+                buyer_marker_line = i
+                for j in range(i, min(i + 5, len(lines))):
+                    inn, kpp = _extract_inn_kpp(lines[j])
+                    if inn:
+                        buyer_inn_direct = inn
+                        buyer_kpp_direct = kpp
+                        break
+
+        # Если ИНН продавца не найден, но есть маркер покупателя -
+        # ищем ИНН ВЫШЕ маркера покупателя (это будет ИНН продавца)
+        if not seller_inn_direct and buyer_marker_line is not None:
+            for j in range(buyer_marker_line - 1, max(0, buyer_marker_line - 10), -1):
+                inn, kpp = _extract_inn_kpp(lines[j])
+                if inn and inn != buyer_inn_direct:  # Убедимся что это не ИНН покупателя
+                    seller_inn_direct = inn
+                    seller_kpp_direct = kpp
+                    break
+
         # Распределяем роли
         # Приоритет: явно определённые роли > порядок появления
         sellers = [o for o in orgs_found if o['role'] == 'seller']
@@ -623,6 +745,14 @@ def _extract_parties_from_ocr(raw: dict) -> Dict[str, Any]:
             result["buyer_inn"] = best_buyer['inn']
             result["buyer_kpp"] = best_buyer['kpp']
             result["buyer_address"] = best_buyer.get('address')
+
+        # Используем прямые ИНН (из маркеров "ИНН/КПП продавца/покупателя") как приоритетный источник
+        if seller_inn_direct:
+            result["seller_inn"] = seller_inn_direct
+            result["seller_kpp"] = seller_kpp_direct
+        if buyer_inn_direct:
+            result["buyer_inn"] = buyer_inn_direct
+            result["buyer_kpp"] = buyer_kpp_direct
 
         # UPD: добираем адреса по маркерам, если они не определились
         try:
@@ -669,8 +799,17 @@ def _extract_doc_info_from_ocr(raw: dict) -> Dict[str, Any]:
         elif 'счёт-фактура' in full_text.lower() or 'счет-фактура' in full_text.lower():
             result["doc_type"] = "Счёт-фактура"
 
-        # Ищем номер и дату рядом с ключевыми словами "Номер документа" и "Дата составления"
-        found_doc_section = False
+        # Словарь месяцев для парсинга текстовых дат
+        months = {
+            'января': '01', 'февраля': '02', 'марта': '03', 'апреля': '04',
+            'мая': '05', 'июня': '06', 'июля': '07', 'августа': '08',
+            'сентября': '09', 'октября': '10', 'ноября': '11', 'декабря': '12'
+        }
+
+        # Паттерн для текстовой даты: "31 октября 2023 г." или "31 октября 2023"
+        text_date_pattern = r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{4})'
+
+        # Ищем номер и дату в формате "Счет-фактура № XX от DD месяц YYYY"
         for i, line in enumerate(rec_texts):
             if not isinstance(line, str):
                 continue
@@ -680,9 +819,40 @@ def _extract_doc_info_from_ocr(raw: dict) -> Dict[str, Any]:
             if 'утвержден' in line_lower or 'постановлен' in line_lower:
                 continue
 
-            # Ищем секцию "Номер документа" / "Дата составления"
+            # УПД/Счёт-фактура: "Счет-фактура № 67 от 31 октября 2023 г."
+            # или "Счет-фактура №" + "67" в следующей строке
+            if re.search(r'сч[её]т[а-я]*-?фактур[а-я]*\s*№', line_lower) and not result["doc_number"]:
+                # Пробуем найти номер в этой строке
+                sf_match = re.search(r'сч[её]т[а-я]*-?фактур[а-я]*\s*№\s*(\d+)', line_lower)
+                if sf_match:
+                    result["doc_number"] = sf_match.group(1)
+                else:
+                    # Номер может быть в следующей строке
+                    for j in range(i + 1, min(i + 3, len(rec_texts))):
+                        next_line = rec_texts[j] if isinstance(rec_texts[j], str) else ""
+                        next_clean = next_line.strip()
+                        # Номер может быть числом или в формате даты со слэшами (30/09/2023)
+                        if re.match(r'^\d{1,10}$', next_clean):
+                            result["doc_number"] = next_clean
+                            break
+                        # Номер в формате DD/MM/YYYY (со слэшами, не путать с датой через точки)
+                        elif re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', next_clean):
+                            result["doc_number"] = next_clean
+                            break
+                # Ищем текстовую дату в этой же или следующих строках
+                combined = line
+                for j in range(i + 1, min(i + 5, len(rec_texts))):
+                    if isinstance(rec_texts[j], str):
+                        combined += " " + rec_texts[j]
+                text_date_match = re.search(text_date_pattern, combined, re.IGNORECASE)
+                if text_date_match and not result["doc_date"]:
+                    day = text_date_match.group(1).zfill(2)
+                    month = months.get(text_date_match.group(2).lower(), '01')
+                    year = text_date_match.group(3)
+                    result["doc_date"] = f"{day}.{month}.{year}"
+
+            # Ищем секцию "Номер документа" / "Дата составления" (ТОРГ-12)
             if 'номер документа' in line_lower:
-                found_doc_section = True
                 # Смотрим следующие строки для номера
                 for j in range(i + 1, min(i + 7, len(rec_texts))):
                     next_line = rec_texts[j] if isinstance(rec_texts[j], str) else ""
@@ -693,9 +863,8 @@ def _extract_doc_info_from_ocr(raw: dict) -> Dict[str, Any]:
                         break
 
             if 'дата составления' in line_lower:
-                found_doc_section = True
-                # Смотрим следующие строки для даты
-                for j in range(i + 1, min(i + 5, len(rec_texts))):
+                # Смотрим следующие строки для даты (увеличен диапазон для ТОРГ-12)
+                for j in range(i + 1, min(i + 10, len(rec_texts))):
                     next_line = rec_texts[j] if isinstance(rec_texts[j], str) else ""
                     date_match = re.search(date_pattern, next_line)
                     if date_match and not result["doc_date"]:
